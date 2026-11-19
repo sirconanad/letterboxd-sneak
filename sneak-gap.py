@@ -90,6 +90,8 @@ class Sneak:
     year: str
     watched: date
     tags: list[str]
+    rating: float | None = None   # 0.5..5 from the diary export, None = unrated
+    liked: bool = False           # whether the film is in the export's likes
     kinostart: date | None = None
     tmdb_id: int | None = None
     gap_days: int | None = None  # release - watched (positive = saw it first)
@@ -100,18 +102,53 @@ def is_sneak_tags(tags: str) -> bool:
     return bool(norm & set(SLEAK_TAGS))
 
 
+def parse_rating(value: str) -> float | None:
+    """Parse the export's Rating column (0.5..5, blank = unrated)."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
 # --------------------------------------------------------------------- export
 
 
-def collect_sneaks(rows: list[dict]) -> list[Sneak]:
+def load_liked(path: Path) -> set[tuple[str, str]]:
+    """Set of (name.lower(), year) liked films, from the export's likes CSV."""
+    if not zipfile.is_zipfile(path):
+        return set()
+    try:
+        with zipfile.ZipFile(path) as zf:
+            raw = zf.read("likes/films.csv").decode("utf-8", "replace")
+    except KeyError:
+        return set()
+    out: set[tuple[str, str]] = set()
+    for row in csv.DictReader(io.StringIO(raw)):
+        name = (row.get("Name") or "").strip().lower()
+        year = (row.get("Year") or "").strip()
+        if name:
+            out.add((name, year))
+    return out
+
+
+def collect_sneaks(rows: list[dict],
+                   liked_set: set | None = None) -> list[Sneak]:
+    liked_set = liked_set or set()
     out = []
     for r in rows:
         if not is_sneak_tags(r.get("Tags") or ""):
             continue
+        name = (r.get("Name") or "?").strip()
+        year = (r.get("Year") or "").strip()
         out.append(Sneak(
-            title=(r.get("Name") or "?").strip(),
-            year=(r.get("Year") or "").strip(),
+            title=name,
+            year=year,
             watched=date.fromisoformat(r.get("Watched Date") or "1970-01-01"),
+            rating=parse_rating(r.get("Rating")),
+            liked=(name.lower(), year) in liked_set,
             tags=[t.strip() for t in (r.get("Tags") or "").split(",")
                   if t.strip()],
         ))
@@ -222,8 +259,8 @@ def fill_kinostarts(sneaks: list[Sneak], tmdb: TMDB, cache: dict,
 
 
 def fmt_table(sneaks: list[Sneak]) -> str:
-    header = (f"{'Film':<42} {'Year':<5} {'Watched':<11} "
-              f"{'Cinema (DE)':<13} {'Gap':>10}")
+    header = (f"{'Film':<42} {'Year':<5} {'Rate':<5} {'Like':<4} "
+              f"{'Watched':<11} {'Cinema (DE)':<13} {'Gap':>10}")
     rows = [header, "-" * len(header)]
     for s in sorted(sneaks, key=lambda x: x.watched, reverse=True):
         if s.kinostart and s.gap_days is not None:
@@ -231,7 +268,9 @@ def fmt_table(sneaks: list[Sneak]) -> str:
                    f"{'before' if s.gap_days > 0 else 'after'} release")
         else:
             gap = "n/a"
-        rows.append(f"{s.title[:42]:<42} {s.year:<5} "
+        rate = f"{s.rating:g}" if s.rating is not None else "–"
+        like = "♥" if s.liked else "–"
+        rows.append(f"{s.title[:42]:<42} {s.year:<5} {rate:<5} {like:<4} "
                     f"{s.watched.isoformat():<11} "
                     f"{s.kinostart.isoformat() if s.kinostart else '–':<13} "
                     f"{gap:>10}")
@@ -263,16 +302,19 @@ def fmt_markdown(sneaks: list[Sneak]) -> str:
              f"{len(sneaks)} diary entries tagged **sneak** or **ov sneak**; "
              "\"gap\" = release date − watch date (negative means watched "
              "after the release).", "",
-             "| Film | Year | Watched | Cinema release (DE) | Gap | Tags |",
-             "|---|---|---|---|---|---|"]
+             "| Film | Year | Rating | Liked | Watched | Cinema release (DE) | Gap | Tags |",
+             "|---|---|---|---|---|---|---|---|"]
     for s in ordered:
         if s.kinostart and s.gap_days is not None:
             gap = (f"+{s.gap_days} (early)" if s.gap_days > 0
                    else f"{s.gap_days} (late)")
         else:
             gap = "n/a"
+        rate = f"{s.rating:g}" if s.rating is not None else "–"
+        like = "Yes" if s.liked else "–"
         lines.append(
-            f"| {s.title} | {s.year} | {s.watched.isoformat()} | "
+            f"| {s.title} | {s.year} | {rate} | {like} | "
+            f"{s.watched.isoformat()} | "
             f"{s.kinostart.isoformat() if s.kinostart else '–'} | "
             f"{gap} | {', '.join(s.tags)} |")
     with_release = [s for s in sneaks if s.gap_days is not None]
@@ -327,7 +369,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     try:
-        sneaks = collect_sneaks(read_diary_csv(export))
+        sneaks = collect_sneaks(read_diary_csv(export), load_liked(export))
     except (ValueError, OSError, KeyError) as exc:
         print(f"error: could not read export: {exc}", file=sys.stderr)
         return 1
@@ -370,12 +412,14 @@ def main(argv: list[str]) -> int:
         out = Path(args.csv)
         with out.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=[
-                "title", "year", "watched", "kinostart", "gap_days",
-                "tags", "tmdb_id"])
+                "title", "year", "rating", "liked", "watched", "kinostart",
+                "gap_days", "tags", "tmdb_id"])
             writer.writeheader()
             for s in sorted(sneaks, key=lambda x: x.watched, reverse=True):
                 writer.writerow({
                     "title": s.title, "year": s.year,
+                    "rating": f"{s.rating:g}" if s.rating is not None else "",
+                    "liked": "yes" if s.liked else "",
                     "watched": s.watched.isoformat(),
                     "kinostart": s.kinostart.isoformat() if s.kinostart else "",
                     "gap_days": s.gap_days if s.gap_days is not None else "",
