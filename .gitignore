@@ -1,0 +1,3 @@
+__pycache__/
+# regenerable TMDB lookup cache
+sneak-cache.json
